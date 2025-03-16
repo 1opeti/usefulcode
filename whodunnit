@@ -1,0 +1,130 @@
+#!/bin/bash
+
+## This is a script that works through music carts in the range  10000 - 79999 and checks artist title etc
+## then updates the MySQL data  
+## If the data is incomplete no change is made.
+## back up the database first
+# Define directories and processed files log
+SOUND_DIR="/var/snd"
+PROCESSED_LOG="/home/rd/dropbox/processed_tracks.log"
+BATCH_SIZE=1000
+
+
+
+
+# Function to find unprocessed WAV files in range 10000-80000
+get_files() {
+    if [[ -s "$PROCESSED_LOG" ]]; then
+        grep -v -f "$PROCESSED_LOG" < <(find /var/snd/ -regextype posix-extended -type f -regex '.*/0[1-7][0-9]{4}_[0-9]{3}\.wav' | sort) | head -n $BATCH_SIZE
+    else
+        find /var/snd/ -regextype posix-extended -type f -regex '.*/0[1-7][0-9]{4}_[0-9]{3}\.wav' | sort | head -n $BATCH_SIZE
+    fi
+}
+
+# Load processed files into an associative array
+declare -A PROCESSED_FILES
+if [[ -f "$PROCESSED_LOG" ]]; then
+    while IFS= read -r line; do
+        PROCESSED_FILES["$line"]=1
+    done < "$PROCESSED_LOG"
+fi
+
+# Store file list in a temp file to allow user input
+TMP_FILE=$(mktemp)
+get_files > "$TMP_FILE"
+
+# Process files
+while IFS= read -r FILE; do
+    FILENAME=$(basename "$FILE")
+
+    # Skip if already processed
+    if [[ ${PROCESSED_FILES["$FILENAME"]} ]]; then
+        echo "Skipping $FILENAME: Already processed."
+        continue
+    fi
+
+    # Extract CARTNUM (first 6 digits)
+    CARTNUM="${FILENAME:0:6}"
+
+    # Extract metadata using songrec, ensuring output is valid
+    # Extract metadata using songrec and jq
+    # Run songrec and store JSON
+      METADATA_JSON=$(songrec audio-file-to-recognized-song "$FILE")
+
+    # Debugging step: Print raw JSON output
+    # echo "DEBUG: Raw metadata JSON:"
+    # echo "$METADATA_JSON"
+
+    # Extract values using jq
+      TITLE=$(echo "$METADATA_JSON" | jq -r '.track.title // "unknown"')
+      ARTIST=$(echo "$METADATA_JSON" | jq -r '.track.subtitle // "unknown"')
+      ALBUM=$(echo "$METADATA_JSON" | jq -r '.track.sections[0].metadata[] | select(.title=="Album") | .text // "unknown"')
+      LABEL=$(echo "$METADATA_JSON" | jq -r '.track.sections[0].metadata[] | select(.title=="Label") | .text // "unknown"')
+    # Extract Year properly, ensuring it's not empty
+      YEAR=$(echo "$METADATA_JSON" | jq -r '.track.sections[0].metadata[] | select(.title=="Released") | .text // "2000"')
+
+    # Ensure YEAR is a valid four-digit year, else default to 2000-01-01
+      if [[ "$YEAR" =~ ^[0-9]{4}$ ]]; then
+         YEAR="${YEAR}-01-01"
+      else
+         YEAR="2000-01-01"
+      fi
+
+    # Debugging step: Print final values
+      echo "DEBUG: Extracted - Title: $TITLE, Artist: $ARTIST, Album: $ALBUM, Label: $LABEL, Year: $YEAR"
+
+    # Display metadata for verification
+      echo "Processing: $FILENAME"
+      echo "Cart Number: $CARTNUM"
+      echo "Title: $TITLE"
+      echo "Artist: $ARTIST"
+      echo "Album: $ALBUM"
+      echo "Label: $LABEL"
+      echo "Year: $YEAR"
+      echo "----------------------"
+    # Allow some screen time to check 
+    sleep 2
+
+    # Escape single quotes for MySQL compatibility
+      TITLE_ESC=$(echo "$TITLE" | sed "s/'/''/g")
+      ARTIST_ESC=$(echo "$ARTIST" | sed "s/'/''/g")
+      ALBUM_ESC=$(echo "$ALBUM" | sed "s/'/''/g")
+      LABEL_ESC=$(echo "$LABEL" | sed "s/'/''/g")
+
+    # Start constructing the SQL update command
+      SQL="UPDATE CART SET"
+
+    # Append fields only if they are not "unknown"
+      if [[ "$ARTIST" != "unknown" ]]; then
+         SQL="$SQL ARTIST='$ARTIST_ESC',"
+      fi
+      if [[ "$TITLE" != "unknown" ]]; then
+         SQL="$SQL TITLE='$TITLE_ESC',"
+      fi
+      if [[ "$ALBUM" != "unknown" ]]; then
+         SQL="$SQL ALBUM='$ALBUM_ESC',"
+      fi
+      if [[ "$LABEL" != "unknown" ]]; then
+         SQL="$SQL \`LABEL\`='$LABEL_ESC',"
+      fi
+
+    # YEAR is always updated
+      SQL="$SQL YEAR='$YEAR', AGENCY='<your name or reference here>'"
+
+    # Remove trailing comma if no other fields were added
+      SQL=$(echo "$SQL" | sed 's/,\s*$//')
+
+    # Append WHERE clause
+      SQL="$SQL WHERE NUMBER='$CARTNUM';"
+
+    # Debugging: Print the final query
+      echo "Executing SQL: $SQL"
+
+    # Execute the query
+      mysql -u rduser -p<password> Rivendell -A -e "$SQL"
+    # Log processed file
+      echo "$FILENAME" >> "$PROCESSED_LOG"
+      sleep 1
+done < "$TMP_FILE"
+
+    rm "$TMP_FILE"
